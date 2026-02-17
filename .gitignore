@@ -1,0 +1,21 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Data (DO NOT COMMIT)
+data/
+*.mp4
+*.mov
+*.avi
+
+# Model weights / large files
+models/
+*.pt
+*.onnx
+
+# OS/editor
+Thumbs.db
+.vscode/
+.idea/
