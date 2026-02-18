@@ -136,8 +136,30 @@ def run_on_video(video_path: Path, sample_fps: float, batch_size: int, dry_run: 
                 )
             )
             boxes = detector.detect(frame)
-
+            """print(f"frame {frame_idx}: boxes={len(boxes)}")
+            if boxes:
+                b0 = boxes[0]
+                print(" first box:", b0.cls_name, b0.conf, b0.x1, b0.y1, b0.x2, b0.y2)"""
+            if produced_total < 5:  # only first few sampled frames
+                dbg = frame.copy()
+                for b in boxes:
+                    cv2.rectangle(dbg, (b.x1, b.y1), (b.x2, b.y2), (0, 255, 0), 2)
+                    cv2.putText(
+                        dbg,
+                        f"{b.cls_name} {b.conf:.2f}",
+                        (b.x1, max(20, b.y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2,
+                    )
+                Path("data/frames/boxed").mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(f"data/frames/boxed/{info.path.stem}_f{frame_idx}.jpg", dbg)
             for b in boxes:
+                Path("data/crops/vehicles").mkdir(parents=True, exist_ok=True)
+                crop = frame[b.y1:b.y2, b.x1:b.x2]
+                crop_path = f"data/crops/vehicles/{info.path.stem}_f{frame_idx}_{b.cls_name}_{int(b.conf*100)}.jpg"
+                cv2.imwrite(crop_path, crop)
                 dets.append(
                     Detection(
                         run_id=run_id,
@@ -149,6 +171,7 @@ def run_on_video(video_path: Path, sample_fps: float, batch_size: int, dry_run: 
                         vehicle_class=b.cls_name,
                         det_conf=b.conf,
                         model=detector.model_name,
+                        crop_path=crop_path
                     )
                 )
             produced_total += 1
