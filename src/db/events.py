@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from uuid import UUID
 from dataclasses import dataclass
 from typing import Optional, Sequence, Any
 from datetime import datetime
@@ -11,9 +11,10 @@ from .db import get_connect
 
 @dataclass
 class VehicleEvent:
+    run_id: UUID
     video_file: str
     frame_idx: int
-    timestamp_mtn: Optional[datetime] = None  # if None, DB default now()
+    timestamp_mtn: Optional[datetime] = None
     vehicle_type: Optional[str] = None
     vehicle_color: Optional[str] = None
     color_conf: Optional[float] = None
@@ -23,7 +24,7 @@ INSERT_SQL = """
 INSERT INTO vehicle_events
   (video_file, frame_idx, timestamp_mtn, vehicle_type, vehicle_color, color_conf, plate_text, plate_conf)
 VALUES
-  (%s, %s, COALESCE(%s, DEFAULT), %s, %s, %s, %s, %s)
+  (%s, %s, %s, COALESCE(%s, DEFAULT), %s, %s, %s, %s, %s)
 RETURNING id;
 """
 
@@ -37,12 +38,13 @@ def insert_event(e: VehicleEvent) -> int:
                 cur.execute(
                     """
                     INSERT INTO vehicle_events
-                      (video_file, frame_idx, timestamp_mtn, vehicle_type, vehicle_color, color_conf, plate_text, plate_conf)
+                      (run_id, video_file, frame_idx, timestamp_mtn, vehicle_type, vehicle_color, color_conf, plate_text, plate_conf)
                     VALUES
-                      (%s, %s, COALESCE(%s, now()), %s, %s, %s, %s, %s)
+                      (%s, %s, %s, COALESCE(%s, now()), %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (
+                        e.run_id,
                         e.video_file,
                         e.frame_idx,
                         e.timestamp_mtn,
@@ -65,6 +67,7 @@ def insert_events_batch(events: Sequence[VehicleEvent]) -> int:
 
     rows: list[tuple[Any, ...]] = [
         (
+            str(e.run_id),
             e.video_file,
             e.frame_idx,
             e.timestamp_mtn,
@@ -85,7 +88,7 @@ def insert_events_batch(events: Sequence[VehicleEvent]) -> int:
                     cur,
                     """
                     INSERT INTO vehicle_events
-                      (video_file, frame_idx, timestamp_mtn, vehicle_type, vehicle_color, color_conf, plate_text, plate_conf)
+                      (run_id, video_file, frame_idx, timestamp_mtn, vehicle_type, vehicle_color, color_conf, plate_text, plate_conf)
                     VALUES %s
                     """,
                     rows,
