@@ -5,7 +5,7 @@ import supervision as sv
 import os
 os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "20000"
 
-VIDEO_DIR = Path("data/raw")
+VIDEO_DIR = Path("data/remuxed")
 OUTPUT_DIR = Path("data/vehicle_dataset")
 
 images_dir = OUTPUT_DIR / "images"
