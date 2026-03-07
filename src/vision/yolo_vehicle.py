@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 
@@ -27,7 +28,7 @@ class BBox:
 
 
 class VehicleDetector:
-    def __init__(self, model_name: str = "yolov8n.pt", conf: float = 0.25):
+    def __init__(self, model_name: str = "yolov8s.pt", conf: float = 0.25):
         self.model_name = model_name
         self.model = YOLO(model_name)
         self.conf = conf
@@ -37,7 +38,8 @@ class VehicleDetector:
         frame_bgr: OpenCV frame (BGR uint8).
         Returns pixel bboxes.
         """
-        results = self.model.predict(frame_bgr, conf=self.conf, verbose=False)
+        device = 0 if torch.cuda.is_available() else "cpu"
+        results = self.model.predict(frame_bgr, device=device, conf=self.conf, iou = 0.6, verbose=False)
         r = results[0]
 
         out: list[BBox] = []

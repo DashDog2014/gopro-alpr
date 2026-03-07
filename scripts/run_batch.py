@@ -31,11 +31,6 @@ class VideoInfo:
 
 
 def guess_video_start_time_utc(video_path: Path) -> datetime:
-    """
-    Best-effort start time (UTC):
-    1) MP4 metadata creation_time via ffprobe (UTC "Z")
-    2) Fallback: file mtime treated as local -> converted to UTC (less reliable)
-    """
     try:
         cmd = [
             "ffprobe",
@@ -80,7 +75,7 @@ def get_video_info(video_path: Path) -> VideoInfo:
 
 def run_on_video(video_path: Path, sample_fps: float, batch_size: int, dry_run: bool, max_events: int | None, rotate: str) -> int:
     run_id = uuid.uuid4()
-    detector = VehicleDetector(model_name="yolov8n.pt", conf=0.25)
+    detector = VehicleDetector(model_name="yolov8n.pt", conf=0.40)
     print("run_id:", run_id)
     info = get_video_info(video_path)
     print(f"\n=== {info.path.name} ===")
