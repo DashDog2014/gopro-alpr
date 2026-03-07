@@ -39,7 +39,7 @@ class VehicleDetector:
         Returns pixel bboxes.
         """
         device = 0 if torch.cuda.is_available() else "cpu"
-        results = self.model.predict(frame_bgr, device=device, conf=self.conf, iou = 0.6, verbose=False)
+        results = self.model.predict(frame_bgr, device=device, conf=self.conf, imgsz = 1280, iou = 0.6, verbose=False)
         r = results[0]
 
         out: list[BBox] = []

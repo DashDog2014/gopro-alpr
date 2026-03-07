@@ -2,6 +2,8 @@ import cv2
 from pathlib import Path
 from ultralytics import YOLO
 import supervision as sv
+import os
+os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "20000"
 
 VIDEO_DIR = Path("data/raw")
 OUTPUT_DIR = Path("data/vehicle_dataset")
@@ -43,7 +45,9 @@ for video in VIDEO_DIR.glob("*.mp4"):
             continue
 
         results = model(frame)[0]
-
+        
+        print(f"Frame {frame_id}")
+        
         detections = sv.Detections.from_ultralytics(results)
 
         # keep only vehicles
