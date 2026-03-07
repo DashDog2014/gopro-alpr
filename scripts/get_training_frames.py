@@ -3,7 +3,7 @@ from pathlib import Path
 from ultralytics import YOLO
 import supervision as sv
 
-VIDEO_DIR = Path("data/remuxed")
+VIDEO_DIR = Path("data/raw")
 OUTPUT_DIR = Path("data/vehicle_dataset")
 
 images_dir = OUTPUT_DIR / "images"
