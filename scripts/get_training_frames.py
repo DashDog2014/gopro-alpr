@@ -1,7 +1,7 @@
 from pathlib import Path
 import cv2
 
-INPUT_DIR = Path("data/raw/test_run")
+INPUT_DIR = Path("data/raw/test-run")
 OUTPUT_DIR = Path("data/vehicle_dataset/images")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
