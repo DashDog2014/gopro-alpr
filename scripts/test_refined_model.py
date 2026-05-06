@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "100000"
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -18,34 +19,50 @@ from ultralytics import YOLO
 # ----------------------------
 # Config
 # ----------------------------
-VIDEO_PATH = Path("data/remuxed/GH340092_clean.MP4")   # change as needed
-MODEL_PATH = Path("runs/detect/runs/model_compare/finetuned/weights/best.pt")  # change if needed
+VIDEO_OG_PATH = Path("data/raw/test-run/GH340092.MP4")
+VIDEO_PATH = Path("data/remuxed/GH340092_clean.MP4")
+MODEL_PATH = Path("runs/detect/runs/model_compare/finetuned/weights/best.pt")
 OUTPUT_CSV = Path("data/output/tracked_vehicle_events.csv")
 
 SAVE_BEST_CROPS = True
 CROPS_DIR = Path("data/output/best_crops")
 
-DEVICE = 0                  # set to "cpu" if needed
+SAVE_DEBUG_VIDEO = True
+DEBUG_VIDEO_PATH = Path("data/output/tracked_debug.mp4")
+DEBUG_VIDEO_FPS = None   # use source FPS if None
+
+DEVICE = 0
 CONF_THRESH = 0.4
 IMG_SIZE = 960
-TRACKER_CFG = "bytetrack.yaml"   # built into ultralytics
-SAMPLE_EVERY_N_FRAMES = 1        # set >1 if you want to skip frames
-MAX_MISSED_FRAMES = 15           # finalize a track if unseen this many processed frames
+TRACKER_CFG = "bytetrack.yaml"
+SAMPLE_EVERY_N_FRAMES = 1
+MAX_MISSED_FRAMES = 15
+
+BOX_THICKNESS = 2
+FONT_SCALE = 0.7
+TEXT_THICKNESS = 2
 
 UTC = timezone.utc
-
+#tracking things
+MIN_FRAMES_SEEN_TO_KEEP = 2 #@2 it saw 2563 vehicles
+DRAW_ONLY_CONFIRMED_TRACKS = True
+MERGE_FRAGMENTED_TRACKS = True
+MAX_REID_GAP_FRAMES = 45
+MAX_REID_CENTER_X_DIST = 180
+MAX_REID_CENTER_Y_DIST = 120
+REQUIRE_SAME_CLASS_FOR_REID = True
 
 # ----------------------------
 # Metadata helpers
 # ----------------------------
-def get_video_creation_time_utc(video_path: Path) -> Optional[datetime]:
+def get_video_creation_time_utc(video_og_path: Path) -> Optional[datetime]:
     try:
         cmd = [
             "ffprobe",
             "-v", "error",
             "-print_format", "json",
             "-show_entries", "format_tags=creation_time",
-            str(video_path),
+            str(video_og_path),
         ]
         out = subprocess.check_output(cmd, text=True)
         data = json.loads(out)
@@ -68,7 +85,6 @@ def estimate_vehicle_color(crop_bgr) -> tuple[str, float]:
     if h < 10 or w < 10:
         return "", 0.0
 
-    # Center crop to reduce road/background
     y1 = int(h * 0.2)
     y2 = int(h * 0.8)
     x1 = int(w * 0.2)
@@ -137,6 +153,8 @@ class TrackState:
     last_seen_time_utc: str
     first_seen_video_sec: float
     last_seen_video_sec: float
+    first_center_x: float = 0.0
+    last_center_x: float = 0.0
     frames_seen: int = 0
     best_obs: Optional[BestObservation] = None
     class_votes: dict[str, float] = field(default_factory=dict)
@@ -144,7 +162,7 @@ class TrackState:
 
 
 # ----------------------------
-# Scoring helpers
+# Scoring / labels / drawing
 # ----------------------------
 def compute_best_frame_score(
     x1: int,
@@ -157,7 +175,6 @@ def compute_best_frame_score(
 ) -> float:
     area = max(0, x2 - x1) * max(0, y2 - y1)
 
-    # Penalize boxes near the edges
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
     dx = abs(cx - frame_w / 2.0) / (frame_w / 2.0) if frame_w else 1.0
@@ -173,16 +190,211 @@ def choose_vote_label(votes: dict[str, float]) -> str:
     return max(votes, key=votes.get)
 
 
+def infer_travel_direction(track: TrackState, min_dx: float = 30.0) -> str:
+    dx = track.last_center_x - track.first_center_x
+    if dx >= min_dx:
+        return "north"
+    if dx <= -min_dx:
+        return "south"
+    return "unknown"
+
+
+def get_track_color(track_id: int) -> tuple[int, int, int]:
+    r = (37 * track_id) % 255
+    g = (97 * track_id) % 255
+    b = (157 * track_id) % 255
+    return int(b), int(g), int(r)  # BGR
+
+
+def draw_box_label(
+    frame,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    label: str,
+    color: tuple[int, int, int],
+    box_thickness: int = 2,
+    font_scale: float = 0.7,
+    text_thickness: int = 2,
+):
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
+
+    (tw, th), baseline = cv2.getTextSize(
+        label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thickness
+    )
+
+    text_y1 = max(0, y1 - th - baseline - 6)
+    text_y2 = text_y1 + th + baseline + 6
+    text_x2 = min(frame.shape[1], x1 + tw + 8)
+
+    cv2.rectangle(frame, (x1, text_y1), (text_x2, text_y2), color, -1)
+    cv2.putText(
+        frame,
+        label,
+        (x1 + 4, text_y2 - baseline - 3),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (255, 255, 255),
+        text_thickness,
+        cv2.LINE_AA,
+    )
+
+# ---------------------------------------------------
+# more helper functions for merging fragmented ID's
+# ---------------------------------------------------
+def best_center(track: TrackState) -> tuple[float, float]:
+    best = track.best_obs
+    if best is None:
+        return 0.0, 0.0
+    return (best.x1 + best.x2) / 2.0, (best.y1 + best.y2) / 2.0
+
+
+def best_box_area(track: TrackState) -> float:
+    best = track.best_obs
+    if best is None:
+        return 0.0
+    return max(0, best.x2 - best.x1) * max(0, best.y2 - best.y1)
+
+
+def track_main_class(track: TrackState) -> str:
+    if track.class_votes:
+        return choose_vote_label(track.class_votes)
+    if track.best_obs is not None:
+        return track.best_obs.class_name
+    return ""
+
+
+def track_main_color(track: TrackState) -> str:
+    if track.color_votes:
+        return choose_vote_label(track.color_votes)
+    if track.best_obs is not None:
+        return track.best_obs.color_name
+    return ""
+
+
+def should_merge_tracks(a: TrackState, b: TrackState) -> bool:
+    """
+    Returns True when b looks like a continuation/reappearance of a.
+
+    This is designed for cases where a car is briefly obstructed and ByteTrack
+    gives it a new ID when it reappears.
+    """
+    if a.best_obs is None or b.best_obs is None:
+        return False
+
+    # b must occur after a
+    frame_gap = b.first_frame_idx - a.last_frame_idx
+    if frame_gap < 0:
+        return False
+
+    if frame_gap > MAX_REID_GAP_FRAMES:
+        return False
+
+    class_a = track_main_class(a)
+    class_b = track_main_class(b)
+    if REQUIRE_SAME_CLASS_FOR_REID and class_a and class_b and class_a != class_b:
+        return False
+
+    ax, ay = best_center(a)
+    bx, by = best_center(b)
+
+    if abs(ax - bx) > MAX_REID_CENTER_X_DIST:
+        return False
+
+    if abs(ay - by) > MAX_REID_CENTER_Y_DIST:
+        return False
+
+    # Avoid merging vehicles moving in opposite directions when direction is known.
+    dir_a = infer_travel_direction(a)
+    dir_b = infer_travel_direction(b)
+    if dir_a != "unknown" and dir_b != "unknown" and dir_a != dir_b:
+        return False
+
+    return True
+
+
+def merge_two_tracks(a: TrackState, b: TrackState) -> TrackState:
+    """
+    Merge b into a. Keep a.track_id as the canonical ID.
+    """
+    a.first_frame_idx = min(a.first_frame_idx, b.first_frame_idx)
+    a.last_frame_idx = max(a.last_frame_idx, b.last_frame_idx)
+
+    if b.first_seen_video_sec < a.first_seen_video_sec:
+        a.first_seen_video_sec = b.first_seen_video_sec
+        a.first_seen_time_utc = b.first_seen_time_utc
+        a.first_center_x = b.first_center_x
+
+    if b.last_seen_video_sec > a.last_seen_video_sec:
+        a.last_seen_video_sec = b.last_seen_video_sec
+        a.last_seen_time_utc = b.last_seen_time_utc
+        a.last_center_x = b.last_center_x
+
+    a.frames_seen += b.frames_seen
+
+    for label, score in b.class_votes.items():
+        a.class_votes[label] = a.class_votes.get(label, 0.0) + score
+
+    for label, score in b.color_votes.items():
+        a.color_votes[label] = a.color_votes.get(label, 0.0) + score
+
+    if a.best_obs is None or (
+        b.best_obs is not None and b.best_obs.score > a.best_obs.score
+    ):
+        a.best_obs = b.best_obs
+
+    return a
+
+
+def merge_fragmented_tracks(tracks: list[TrackState]) -> list[TrackState]:
+    if not MERGE_FRAGMENTED_TRACKS:
+        return tracks
+
+    tracks = [
+        t for t in tracks
+        if t.best_obs is not None and t.frames_seen >= MIN_FRAMES_SEEN_TO_KEEP
+    ]
+
+    tracks.sort(key=lambda t: t.first_frame_idx)
+
+    merged: list[TrackState] = []
+
+    for track in tracks:
+        merged_into_existing = False
+
+        # Search recent merged tracks backwards first.
+        for existing in reversed(merged):
+            if should_merge_tracks(existing, track):
+                merge_two_tracks(existing, track)
+                merged_into_existing = True
+                break
+
+        if not merged_into_existing:
+            merged.append(track)
+
+    return merged
+
+def keep_track(track: TrackState) -> bool:
+    if track.best_obs is None:
+        return False
+
+    if track.frames_seen < MIN_FRAMES_SEEN_TO_KEEP:
+        return False
+
+    return True
+
 # ----------------------------
 # Finalization
 # ----------------------------
-def finalize_track(writer, track: TrackState):
-    if track.best_obs is None:
+def write_track_row(writer, track: TrackState):
+    best = track.best_obs
+    if best is None:
         return
 
-    best = track.best_obs
     final_class = choose_vote_label(track.class_votes) or best.class_name
     final_color = choose_vote_label(track.color_votes) or best.color_name
+    travel_direction = infer_travel_direction(track)
 
     writer.writerow([
         track.track_id,
@@ -200,6 +412,7 @@ def finalize_track(writer, track: TrackState):
         final_class,
         best.class_conf,
         final_color,
+        travel_direction,
         best.color_conf,
         "",   # brand
         "",   # brand_conf
@@ -211,8 +424,6 @@ def finalize_track(writer, track: TrackState):
         best.y2,
         best.crop_path,
     ])
-
-
 # ----------------------------
 # Main
 # ----------------------------
@@ -220,6 +431,8 @@ def main():
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     if SAVE_BEST_CROPS:
         CROPS_DIR.mkdir(parents=True, exist_ok=True)
+    if SAVE_DEBUG_VIDEO:
+        DEBUG_VIDEO_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not VIDEO_PATH.exists():
         raise FileNotFoundError(f"Video not found: {VIDEO_PATH}")
@@ -238,6 +451,9 @@ def main():
     if fps <= 0:
         raise RuntimeError("Could not read FPS")
 
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
     print(f"Video: {video_source}")
     print(f"Model: {MODEL_PATH}")
     print(f"FPS: {fps:.3f}")
@@ -245,7 +461,21 @@ def main():
     if video_start_utc:
         print(f"creation_time UTC: {video_start_utc.isoformat()}")
 
+    debug_writer = None
+    if SAVE_DEBUG_VIDEO:
+        out_fps = float(fps if DEBUG_VIDEO_FPS is None else DEBUG_VIDEO_FPS)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        debug_writer = cv2.VideoWriter(
+            str(DEBUG_VIDEO_PATH),
+            fourcc,
+            out_fps,
+            (frame_w, frame_h),
+        )
+        if not debug_writer.isOpened():
+            raise RuntimeError(f"Could not open debug video writer: {DEBUG_VIDEO_PATH}")
+
     active_tracks: dict[int, TrackState] = {}
+    finished_tracks: list[TrackState] = []
 
     with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -265,6 +495,7 @@ def main():
             "vehicle_class",
             "class_conf",
             "vehicle_color",
+            "travel_direction",
             "color_conf",
             "brand",
             "brand_conf",
@@ -284,7 +515,11 @@ def main():
             if not ret:
                 break
 
+            debug_frame = frame.copy()
+
             if frame_idx % SAMPLE_EVERY_N_FRAMES != 0:
+                if debug_writer is not None:
+                    debug_writer.write(debug_frame)
                 frame_idx += 1
                 continue
 
@@ -304,8 +539,6 @@ def main():
             )
 
             r = results[0]
-            frame_h, frame_w = frame.shape[:2]
-
             seen_track_ids_this_frame = set()
 
             if r.boxes is not None and len(r.boxes) > 0 and r.boxes.id is not None:
@@ -325,16 +558,16 @@ def main():
                     if x2 <= x1 or y2 <= y1:
                         continue
 
-                    seen_track_ids_this_frame.add(int(track_id))
+                    track_id_int = int(track_id)
+                    seen_track_ids_this_frame.add(track_id_int)
                     class_name = names[int(cls_id)]
-
                     crop = frame[y1:y2, x1:x2]
                     color_name, color_conf = estimate_vehicle_color(crop)
+                    cx = (x1 + x2) / 2.0
 
-                    # create or update track state
-                    if int(track_id) not in active_tracks:
-                        active_tracks[int(track_id)] = TrackState(
-                            track_id=int(track_id),
+                    if track_id_int not in active_tracks:
+                        active_tracks[track_id_int] = TrackState(
+                            track_id=track_id_int,
                             video_source=video_source,
                             first_frame_idx=frame_idx,
                             last_frame_idx=frame_idx,
@@ -342,19 +575,26 @@ def main():
                             last_seen_time_utc=timestamp_utc,
                             first_seen_video_sec=video_time_sec,
                             last_seen_video_sec=video_time_sec,
+                            first_center_x=cx,
+                            last_center_x=cx,
                         )
 
-                    state = active_tracks[int(track_id)]
+                    state = active_tracks[track_id_int]
                     state.last_frame_idx = frame_idx
                     state.last_seen_time_utc = timestamp_utc
                     state.last_seen_video_sec = video_time_sec
+                    state.last_center_x = cx
                     state.frames_seen += 1
+
                     state.class_votes[class_name] = state.class_votes.get(class_name, 0.0) + float(conf)
                     if color_name:
                         state.color_votes[color_name] = state.color_votes.get(color_name, 0.0) + float(color_conf)
 
                     best_score = compute_best_frame_score(
-                        x1=x1, y1=y1, x2=x2, y2=y2,
+                        x1=x1,
+                        y1=y1,
+                        x2=x2,
+                        y2=y2,
                         conf=float(conf),
                         frame_w=frame_w,
                         frame_h=frame_h,
@@ -368,7 +608,7 @@ def main():
                     if should_replace:
                         crop_path = ""
                         if SAVE_BEST_CROPS:
-                            crop_name = f"{VIDEO_PATH.stem}_track{int(track_id):05d}_best.jpg"
+                            crop_name = f"{VIDEO_PATH.stem}_track{track_id_int:05d}_best.jpg"
                             crop_path_obj = CROPS_DIR / crop_name
                             cv2.imwrite(str(crop_path_obj), crop)
                             crop_path = str(crop_path_obj)
@@ -389,7 +629,22 @@ def main():
                             score=float(best_score),
                         )
 
-            # finalize tracks not seen recently
+                    # Optionally hide tracks from the debug video until they survive long enough.
+                    # This prevents one-frame obstruction glitches from showing up as extra IDs.
+                    if not DRAW_ONLY_CONFIRMED_TRACKS or state.frames_seen >= MIN_FRAMES_SEEN_TO_KEEP:
+                        direction = infer_travel_direction(state) if state.frames_seen > 1 else "unknown"
+                        draw_color = get_track_color(track_id_int)
+                        label = f"ID {track_id_int} | {class_name} | {float(conf):.2f} | {direction}"
+                        draw_box_label(
+                            debug_frame,
+                            x1, y1, x2, y2,
+                            label=label,
+                            color=draw_color,
+                            box_thickness=BOX_THICKNESS,
+                            font_scale=FONT_SCALE,
+                            text_thickness=TEXT_THICKNESS,
+                        )
+
             to_finalize = []
             for tid, state in active_tracks.items():
                 if tid not in seen_track_ids_this_frame:
@@ -397,16 +652,31 @@ def main():
                         to_finalize.append(tid)
 
             for tid in to_finalize:
-                finalize_track(writer, active_tracks[tid])
+                track = active_tracks[tid]
+                if keep_track(track):
+                    finished_tracks.append(track)
                 del active_tracks[tid]
+
+            if debug_writer is not None:
+                debug_writer.write(debug_frame)
 
             frame_idx += 1
 
-        # finalize remaining tracks at EOF
         for tid in sorted(active_tracks):
-            finalize_track(writer, active_tracks[tid])
+            track = active_tracks[tid]
+            if keep_track(track):
+                finished_tracks.append(track)
+
+        final_tracks = merge_fragmented_tracks(finished_tracks)
+
+        for track in final_tracks:
+            write_track_row(writer, track)
 
     cap.release()
+    if debug_writer is not None:
+        debug_writer.release()
+        print(f"Saved debug video to {DEBUG_VIDEO_PATH}")
+
     print(f"Done. Wrote tracked vehicle events to {OUTPUT_CSV}")
 
 
